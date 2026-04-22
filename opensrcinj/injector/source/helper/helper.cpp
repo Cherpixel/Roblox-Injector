@@ -11,6 +11,12 @@
 #include <Psapi.h>
 #include "utilhelper.hpp"
 
+struct SEH_DATA {
+    void* table;
+    DWORD count;
+    uintptr_t base;
+};
+
 extern "C" {
 	DWORD idx_rd = 0, idx_wr = 0, idx_al = 0, idx_pr = 0, idx_qs = 0, idx_mv = 0, idx_uv = 0, idx_cs = 0, idx_op = 0, idx_cl = 0;
 	uintptr_t sys_rd = 0, sys_wr = 0, sys_al = 0, sys_pr = 0, sys_qs = 0, sys_mv = 0, sys_uv = 0, sys_cs = 0, sys_op = 0, sys_cl = 0;
@@ -501,6 +507,21 @@ static bool apply_imports(BYTE* base, IMAGE_NT_HEADERS* nt) {
     }
     return true;
 }
+
+void c_ldr::run_remote(void* fn, void* data, size_t size) {
+    if (!fn) { std::cout << "Invalid fn" << std::endl; return; }
+    BYTE* remoteData = nullptr; SIZE_T written = 0; NTSTATUS wst{};
+    if (size) {
+        remoteData = reinterpret_cast<BYTE*>(VirtualAllocEx(rP, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!remoteData) { std::cout << "Alloc failed" << std::endl; return; }
+        if (!nt_wvm(rP, remoteData, data, size, &written, &wst) || written != size) { std::cout << "Write failed" << std::endl; return; }
+    }
+    BYTE sc[] = { 0x48, 0x83, 0xEC, 0x28, 0x48, 0xB9, 0,0,0,0,0,0,0,0, 0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3 };
+    uintptr_t dataVal = reinterpret_cast<uintptr_t>(remoteData), fnVal = reinterpret_cast<uintptr_t>(fn);
+    memcpy(&sc[6], &dataVal, sizeof(dataVal)); memcpy(&sc[16], &fnVal, sizeof(fnVal));
+    auto t = std::make_unique<r_t_d>(static_cast<DWORD>(this->pI), sc, sizeof(sc)); t->run();
+}
+
 void c_ldr::init(std::int32_t pI, HANDLE rP, std::uintptr_t hB, std::uintptr_t sB) { this->pI = pI; this->rP = rP; this->hB = hB; this->sB = sB; }
 bool c_ldr::res_i(void* tI, IMAGE_NT_HEADERS* nH) { auto& imp_dir = nH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]; if (!imp_dir.VirtualAddress) return false; return apply_imports(reinterpret_cast<BYTE*>(tI), nH); }
 void c_ldr::map(const std::string& mN, uintptr_t remoteBase) {
@@ -519,6 +540,43 @@ void c_ldr::map(const std::string& mN, uintptr_t remoteBase) {
     if (!apply_imports(mapped.get(), mNt)) { std::cout << "Import error" << std::endl; return; }
     this->tB = reinterpret_cast<BYTE*>(remoteBase); SIZE_T written = 0; NTSTATUS wst{};
     if (!nt_wvm(rP, reinterpret_cast<PVOID>(remoteBase), mapped.get(), imgSize, &written, &wst) || written != imgSize) { std::cout << "Write failed" << std::endl; return; }
+
+    auto& exDir = mNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exDir.VirtualAddress) {
+        uintptr_t tableAddr = remoteBase + exDir.VirtualAddress;
+        uintptr_t count = exDir.Size / 12;
+        void* AddFunctionTable = GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAddFunctionTable");
+
+        BYTE sc_seh[] = {
+            0x48, 0x83, 0xEC, 0x28,      // sub rsp, 28h
+            0x48, 0xB9, 0,0,0,0,0,0,0,0, // mov rcx, [tableAddr]
+            0x48, 0xBA, 0,0,0,0,0,0,0,0, // mov rdx, [count]
+            0x49, 0xB8, 0,0,0,0,0,0,0,0, // mov r8, [remoteBase]
+            0x48, 0xB8, 0,0,0,0,0,0,0,0, // mov rax, [AddFunctionTable]
+            0xFF, 0xD0,                  // call rax
+            0x48, 0x83, 0xC4, 0x28,      // add rsp, 28h
+            0xC3                         // ret
+        };
+
+        memcpy(&sc_seh[6], &tableAddr, 8);
+        memcpy(&sc_seh[16], &count, 8);
+        memcpy(&sc_seh[26], &remoteBase, 8);
+        memcpy(&sc_seh[36], &AddFunctionTable, 8);
+
+        auto t = std::make_unique<r_t_d>(static_cast<DWORD>(this->pI), sc_seh, sizeof(sc_seh));
+        t->run();
+    }
+
+    auto& tlsDir = mNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsDir.VirtualAddress) {
+        auto* tls = (PIMAGE_TLS_DIRECTORY64)(mapped.get() + tlsDir.VirtualAddress);
+        if (tls->AddressOfCallBacks) {
+            uintptr_t* callbacks = (uintptr_t*)tls->AddressOfCallBacks;
+            for (int i = 0; callbacks[i] != 0; i++)
+                this->run_remote((void*)callbacks[i], (void*)remoteBase, 0);
+        }
+    }
+
     sec = IMAGE_FIRST_SECTION(ntHdr);
     for (WORD i = 0; i < ntHdr->FileHeader.NumberOfSections; i++) {
         if (!sec[i].Misc.VirtualSize) continue; PVOID secBase = reinterpret_cast<PVOID>(remoteBase + sec[i].VirtualAddress); SIZE_T secSz = sec[i].Misc.VirtualSize; DWORD ch = sec[i].Characteristics, prot = PAGE_READONLY, old = 0;

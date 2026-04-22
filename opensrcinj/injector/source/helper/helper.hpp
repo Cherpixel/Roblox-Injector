@@ -32,6 +32,8 @@ public:
 	void init(std::int32_t pI, HANDLE rP, std::uintptr_t hB, std::uintptr_t sB);
 	bool res_i(void* tI, IMAGE_NT_HEADERS* nH);
 	void map(const std::string& mN, uintptr_t remoteBase);
+
+	void run_remote(void* fn, void* data, size_t size);
 };
 namespace ctx {
 	inline DWORD p;
